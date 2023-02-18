@@ -1452,5 +1452,19 @@ def test_layer_norm_symbolic():
     tvm.ir.assert_structural_equal(mod, Expected)
 
 
+def test_group_norm():
+    # fmt: off
+    @tvm.script.ir_module
+    class GroupNorm:
+        @R.function
+        def main(x: R.Tensor((2, 4, 4, 5), "float32"), gamma: R.Tensor((4,), "float32"), beta: R.Tensor((4,), "float32")) -> R.Tensor((2, 4, 4, 5), "float32"):
+            gv: R.Tensor((2, 4, 4, 5), "float32") = R.nn.group_norm(x, gamma, beta, num_groups=2, channel_axis=1, axes=[2, 3])
+            return gv
+    # fmt: on
+
+    mod = LegalizeOps()(GroupNorm)
+    print(mod.script())
+
+
 if __name__ == "__main__":
     tvm.testing.main()
