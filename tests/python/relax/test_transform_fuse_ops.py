@@ -18,7 +18,7 @@
 import tvm
 import tvm.testing
 from tvm import relax, topi
-from tvm.script import ir as I, relax as R
+from tvm.script import ir as I, relax as R, tir as T
 
 
 def _check(mod_actual, mod_expected):
