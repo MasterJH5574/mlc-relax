@@ -356,5 +356,66 @@ def test_multiple_bufer_stores_fallback():
     assert new_mod["cumsum"].attrs["op_pattern"] == OpPatternKind.kOpaque
 
 
+def test_group_norm():
+    # fmt: off
+    @tvm.script.ir_module
+    class GroupNorm:
+        @T.prim_func
+        def group_norm(rxplaceholder: T.Buffer((1, 512, 64, 64), "float32"), rxplaceholder_1: T.Buffer((512,), "float32"), rxplaceholder_2: T.Buffer((512,), "float32"), T_reshape: T.Buffer((1, 512, 64, 64), "float32")):
+            T.func_attr({"tir.noalias": True})
+            T_reshape_1 = T.alloc_buffer((1, 32, 16, 64, 64))
+            rxplaceholder_red_temp_v0 = T.alloc_buffer((1, 32))
+            rxplaceholder_red_temp_v1 = T.alloc_buffer((1, 32))
+            T_reshape_2 = T.alloc_buffer((32, 16))
+            T_reshape_3 = T.alloc_buffer((32, 16))
+            T_group_norm = T.alloc_buffer((1, 32, 16, 64, 64))
+            for ax0, ax1, ax2, ax3, ax4 in T.grid(1, 32, 16, 64, 64):
+                with T.block("T_reshape"):
+                    v_ax0, v_ax1, v_ax2, v_ax3, v_ax4 = T.axis.remap("SSSSS", [ax0, ax1, ax2, ax3, ax4])
+                    T.reads(rxplaceholder[0, (v_ax1 * 16 + (v_ax4 // 64 + v_ax3) // 64 + v_ax2) % 512, (v_ax4 // 64 + v_ax3) % 64, v_ax4 % 64])
+                    T.writes(T_reshape_1[v_ax0, v_ax1, v_ax2, v_ax3, v_ax4])
+                    T_reshape_1[v_ax0, v_ax1, v_ax2, v_ax3, v_ax4] = rxplaceholder[0, (v_ax1 * 16 + (v_ax4 // 64 + v_ax3) // 64 + v_ax2) % 512, (v_ax4 // 64 + v_ax3) % 64, v_ax4 % 64]
+            for ax0, ax1, k2, k3, k4 in T.grid(1, 32, 16, 64, 64):
+                with T.block("rxplaceholder_red_temp"):
+                    v_ax0, v_ax1, v_k2, v_k3, v_k4 = T.axis.remap("SSRRR", [ax0, ax1, k2, k3, k4])
+                    T.reads(T_reshape_1[v_ax0, v_ax1, v_k2, v_k3, v_k4])
+                    T.writes(rxplaceholder_red_temp_v0[v_ax0, v_ax1], rxplaceholder_red_temp_v1[v_ax0, v_ax1])
+                    with T.init():
+                        rxplaceholder_red_temp_v0[v_ax0, v_ax1] = T.float32(0)
+                        rxplaceholder_red_temp_v1[v_ax0, v_ax1] = T.float32(0)
+                    v_rxplaceholder_red_temp_v0: T.float32 = rxplaceholder_red_temp_v0[v_ax0, v_ax1] + T_reshape_1[v_ax0, v_ax1, v_k2, v_k3, v_k4]
+                    v_rxplaceholder_red_temp_v1: T.float32 = rxplaceholder_red_temp_v1[v_ax0, v_ax1] + T_reshape_1[v_ax0, v_ax1, v_k2, v_k3, v_k4] * T_reshape_1[v_ax0, v_ax1, v_k2, v_k3, v_k4]
+                    rxplaceholder_red_temp_v0[v_ax0, v_ax1] = v_rxplaceholder_red_temp_v0
+                    rxplaceholder_red_temp_v1[v_ax0, v_ax1] = v_rxplaceholder_red_temp_v1
+            for ax0, ax1 in T.grid(32, 16):
+                with T.block("T_reshape_1"):
+                    v_ax0, v_ax1 = T.axis.remap("SS", [ax0, ax1])
+                    T.reads(rxplaceholder_1[(v_ax0 * 16 + v_ax1) % 512])
+                    T.writes(T_reshape_2[v_ax0, v_ax1])
+                    T_reshape_2[v_ax0, v_ax1] = rxplaceholder_1[(v_ax0 * 16 + v_ax1) % 512]
+            for ax0, ax1 in T.grid(32, 16):
+                with T.block("T_reshape_2"):
+                    v_ax0, v_ax1 = T.axis.remap("SS", [ax0, ax1])
+                    T.reads(rxplaceholder_2[(v_ax0 * 16 + v_ax1) % 512])
+                    T.writes(T_reshape_3[v_ax0, v_ax1])
+                    T_reshape_3[v_ax0, v_ax1] = rxplaceholder_2[(v_ax0 * 16 + v_ax1) % 512]
+            for ax0, ax1, ax2, ax3, ax4 in T.grid(1, 32, 16, 64, 64):
+                with T.block("T_group_norm"):
+                    v_ax0, v_ax1, v_ax2, v_ax3, v_ax4 = T.axis.remap("SSSSS", [ax0, ax1, ax2, ax3, ax4])
+                    T.reads(T_reshape_1[v_ax0, v_ax1, v_ax2, v_ax3, v_ax4], rxplaceholder_red_temp_v0[v_ax0, v_ax1], rxplaceholder_red_temp_v1[v_ax0, v_ax1], T_reshape_2[v_ax1, v_ax2], T_reshape_3[v_ax1, v_ax2])
+                    T.writes(T_group_norm[v_ax0, v_ax1, v_ax2, v_ax3, v_ax4])
+                    T_group_norm[v_ax0, v_ax1, v_ax2, v_ax3, v_ax4] = (T_reshape_1[v_ax0, v_ax1, v_ax2, v_ax3, v_ax4] - rxplaceholder_red_temp_v0[v_ax0, v_ax1] * T.float32(1.52587890625e-05)) * T.rsqrt(rxplaceholder_red_temp_v1[v_ax0, v_ax1] * T.float32(1.52587890625e-05) - rxplaceholder_red_temp_v0[v_ax0, v_ax1] * T.float32(1.52587890625e-05) * (rxplaceholder_red_temp_v0[v_ax0, v_ax1] * T.float32(1.52587890625e-05)) + T.float32(9.9999999999999995e-07)) * T_reshape_2[v_ax1, v_ax2] + T_reshape_3[v_ax1, v_ax2]
+            for ax0, ax1, ax2, ax3 in T.grid(1, 512, 64, 64):
+                with T.block("T_reshape_3"):
+                    v_ax0, v_ax1, v_ax2, v_ax3 = T.axis.remap("SSSS", [ax0, ax1, ax2, ax3])
+                    T.reads(T_group_norm[0, ((v_ax3 // 64 + v_ax2) // 64 + v_ax1) % 512 // 16, ((v_ax3 // 64 + v_ax2) // 64 + v_ax1) % 16, (v_ax3 // 64 + v_ax2) % 64, v_ax3 % 64])
+                    T.writes(T_reshape[v_ax0, v_ax1, v_ax2, v_ax3])
+                    T_reshape[v_ax0, v_ax1, v_ax2, v_ax3] = T_group_norm[0, ((v_ax3 // 64 + v_ax2) // 64 + v_ax1) % 512 // 16, ((v_ax3 // 64 + v_ax2) // 64 + v_ax1) % 16, (v_ax3 // 64 + v_ax2) % 64, v_ax3 % 64]
+    # fmt: on
+    mod = GroupNorm
+    new_mod = relax.transform.AnnotateTIROpPattern()(mod)
+    assert new_mod["group_norm"].attrs["op_pattern"] == OpPatternKind.kOutEWiseFusable
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
