@@ -79,6 +79,11 @@ State StateNode::Copy() const {
 
 // Do nothing; Inherited from ScheduleRuleNode
 void MultiLevelTilingNode::InitializeWithTuneContext(const TuneContext& context) {
+  if (context->target.value()->kind->name == "metal" && !this->vector_load_lens.empty()) {
+    // Set vector_load_lens to 1 to disable vectorization on metal.
+    this->vector_load_lens = {1};
+  }
+
   if (Optional<Integer> v = context->target.value()->GetAttr<Integer>("max_threads_per_block")) {
     this->max_threads_per_block_ = v.value()->value;
     if (Optional<Integer> v = context->target.value()->GetAttr<Integer>("thread_warp_size")) {
