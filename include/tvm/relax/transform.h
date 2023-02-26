@@ -190,7 +190,7 @@ TVM_DLL Pass LegalizeOps(Optional<Map<String, PackedFunc>> cmap);
  *
  * \return The Pass.
  */
-TVM_DLL Pass LiftTransformParams();
+TVM_DLL Pass LiftTransformParams(Array<String> entry_names);
 
 /*!
  * \brief Annotate Op Pattern Kind for TIR functions, which is used in FuseOps.

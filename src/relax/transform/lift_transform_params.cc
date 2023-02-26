@@ -203,19 +203,22 @@ class LiftTransformParamsPlanner : public ExprVisitor {
  */
 class TransformParamsLifter : public ExprMutator {
  public:
-  explicit TransformParamsLifter(const IRModule& module) : ExprMutator(module) {}
+  explicit TransformParamsLifter(const IRModule& module, Array<String> entry_names)
+      : ExprMutator(module), entry_names_(std::move(entry_names)) {}
 
   IRModule Lift() {
     auto mod = builder_->GetContextIRModule();
-    GlobalVar gv_main = mod->GetGlobalVar("main");
-    Function func = Downcast<Function>(mod->Lookup(gv_main));
-    func = RewriteFunc(func);
-    builder_->UpdateFunction(gv_main, func);
+    for (String entry_name : entry_names_) {
+      GlobalVar gv_main = mod->GetGlobalVar(entry_name);
+      Function func = Downcast<Function>(mod->Lookup(gv_main));
+      func = RewriteFunc(func, entry_name + "_transform_params");
+      builder_->UpdateFunction(gv_main, func);
+    }
     return builder_->GetContextIRModule();
   }
 
  private:
-  Function RewriteFunc(const Function& func) {
+  Function RewriteFunc(const Function& func, String new_func_name) {
     const std::string attr_num_input = "num_input";
     auto opt_num_input = func->attrs.GetAttr<Integer>(attr_num_input);
     if (!opt_num_input.defined()) {
@@ -228,7 +231,7 @@ class TransformParamsLifter : public ExprMutator {
     lift_plan_ = planner.Plan(func, params_begin);
 
     // Step 2: Add the lifted function to the module
-    builder_->AddFunction(lift_plan_.f_transform_params, "transform_params");
+    builder_->AddFunction(lift_plan_.f_transform_params, new_func_name);
 
     // Step 3: Update the current function.
 
@@ -281,12 +284,13 @@ class TransformParamsLifter : public ExprMutator {
   std::unordered_map<Var, Expr, ObjectPtrHash, ObjectPtrEqual> param_remap_;
   // The plan of lifting the transform params
   LiftTransformParamsInfoPlan lift_plan_;
+  Array<String> entry_names_;
 };
 
 namespace transform {
-Pass LiftTransformParams() {
+Pass LiftTransformParams(Array<String> entry_names) {
   runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func =
-      [=](IRModule m, PassContext pc) { return TransformParamsLifter(m).Lift(); };
+      [=](IRModule m, PassContext pc) { return TransformParamsLifter(m, entry_names).Lift(); };
   return CreateModulePass(pass_func, 1, "LiftTransformParams", {});
 }
 
