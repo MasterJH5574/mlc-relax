@@ -28,6 +28,7 @@ def test_op_correctness():
     x = relax.Var("x", R.Tensor((2, 3), "float32"))
     y = relax.Var("x", R.Tensor((2, 3), "float32"))
     assert relax.op.where(cond, x, y).op == Op.get("relax.where")
+    assert relax.op.argmax(x).op == Op.get("relax.argmax")
 
 
 def _check_inference(bb: relax.BlockBuilder, call: relax.Call, expected_sinfo: relax.StructInfo):
@@ -272,6 +273,153 @@ def test_where_infer_struct_info_wrong_input_type():
         bb.normalize(relax.op.where(cond1, x0, y1))
     with pytest.raises(TVMError):
         bb.normalize(relax.op.where(cond1, x1, y0))
+
+
+def test_argmax_infer_struct_info():
+    bb = relax.BlockBuilder()
+    x0 = relax.Var("x", R.Tensor((2, 3, 4, 5), "float32"))
+    x1 = relax.Var("x", R.Tensor("float32", ndim=4))
+    x2 = relax.Var("x", R.Tensor("float32"))
+    x3 = relax.Var("x", R.Tensor((2, 3, 4, 5)))
+
+    _check_inference(bb, relax.op.argmax(x0, axis=1), relax.TensorStructInfo((2, 4, 5), "int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x0, axis=1, keepdims=True),
+        relax.TensorStructInfo((2, 1, 4, 5), "int64"),
+    )
+    _check_inference(bb, relax.op.argmax(x0, axis=None), relax.TensorStructInfo((), "int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x0, axis=None, keepdims=True),
+        relax.TensorStructInfo((1, 1, 1, 1), "int64"),
+    )
+    _check_inference(bb, relax.op.argmax(x1, axis=1), relax.TensorStructInfo(dtype="int64", ndim=3))
+    _check_inference(
+        bb,
+        relax.op.argmax(x1, axis=1, keepdims=True),
+        relax.TensorStructInfo(dtype="int64", ndim=4),
+    )
+    _check_inference(bb, relax.op.argmax(x1, axis=None), relax.TensorStructInfo((), "int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x1, axis=None, keepdims=True),
+        relax.TensorStructInfo((1, 1, 1, 1), "int64"),
+    )
+    _check_inference(bb, relax.op.argmax(x2, axis=1), relax.TensorStructInfo(dtype="int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x2, axis=1, keepdims=True),
+        relax.TensorStructInfo(dtype="int64"),
+    )
+    _check_inference(bb, relax.op.argmax(x2, axis=None), relax.TensorStructInfo((), "int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x2, axis=None, keepdims=True),
+        relax.TensorStructInfo(dtype="int64"),
+    )
+    _check_inference(
+        bb, relax.op.argmax(x3, axis=1), relax.TensorStructInfo((2, 4, 5), dtype="int64")
+    )
+    _check_inference(
+        bb,
+        relax.op.argmax(x3, axis=1, keepdims=True),
+        relax.TensorStructInfo((2, 1, 4, 5), dtype="int64"),
+    )
+    _check_inference(bb, relax.op.argmax(x3, axis=None), relax.TensorStructInfo((), dtype="int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x3, axis=None, keepdims=True),
+        relax.TensorStructInfo((1, 1, 1, 1), dtype="int64"),
+    )
+    _check_inference(
+        bb,
+        relax.op.argmax(x0, axis=1, keepdims=True),
+        relax.TensorStructInfo((2, 1, 4, 5), "int64"),
+    )
+    _check_inference(bb, relax.op.argmax(x0, axis=-1), relax.TensorStructInfo((2, 3, 4), "int64"))
+
+
+def test_argmax_infer_struct_info_shape_symbolic():
+    bb = relax.BlockBuilder()
+    a = tir.Var("a", "int64")
+    b = tir.Var("b", "int64")
+    c = tir.Var("c", "int64")
+    d = tir.Var("d", "int64")
+    x = relax.Var("x", R.Tensor((a, b, c, d), "int64"))
+
+    _check_inference(bb, relax.op.argmax(x, axis=1), relax.TensorStructInfo((a, c, d), "int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x, axis=1, keepdims=True),
+        relax.TensorStructInfo((a, 1, c, d), "int64"),
+    )
+    _check_inference(bb, relax.op.argmax(x, axis=None), relax.TensorStructInfo((), "int64"))
+    _check_inference(
+        bb,
+        relax.op.argmax(x, axis=None, keepdims=True),
+        relax.TensorStructInfo((1, 1, 1, 1), "int64"),
+    )
+
+
+def test_argmax_infer_struct_info_shape_var():
+    bb = relax.BlockBuilder()
+    s0 = relax.Var("s", relax.ShapeStructInfo(ndim=4))
+    s1 = relax.Var("s", relax.ShapeStructInfo())
+    x0 = relax.Var("x", relax.TensorStructInfo(s0, "int64"))
+    x1 = relax.Var("x", relax.TensorStructInfo(s1, "int64"))
+
+    _check_inference(bb, relax.op.argmax(x0), relax.TensorStructInfo((), dtype="int64"))
+    _check_inference(
+        bb, relax.op.argmax(x0, keepdims=True), relax.TensorStructInfo((1, 1, 1, 1), dtype="int64")
+    )
+    _check_inference(bb, relax.op.argmax(x0, axis=2), relax.TensorStructInfo(dtype="int64", ndim=3))
+    _check_inference(
+        bb,
+        relax.op.argmax(x0, axis=2, keepdims=True),
+        relax.TensorStructInfo(dtype="int64", ndim=4),
+    )
+    _check_inference(bb, relax.op.argmax(x1), relax.TensorStructInfo((), dtype="int64"))
+    _check_inference(bb, relax.op.argmax(x1, keepdims=True), relax.TensorStructInfo(dtype="int64"))
+    _check_inference(bb, relax.op.argmax(x1, axis=2), relax.TensorStructInfo(dtype="int64"))
+    _check_inference(
+        bb, relax.op.argmax(x1, axis=2, keepdims=True), relax.TensorStructInfo(dtype="int64")
+    )
+
+
+def test_argmax_infer_struct_info_more_input_dtype():
+    bb = relax.BlockBuilder()
+    x0 = relax.Var("x", R.Tensor((2, 3, 4, 5), "float16"))
+    x1 = relax.Var("x", R.Tensor((2, 3, 4, 5), "int8"))
+
+    _check_inference(bb, relax.op.argmax(x0), relax.TensorStructInfo((), "int64"))
+    _check_inference(bb, relax.op.argmax(x1), relax.TensorStructInfo((), "int64"))
+
+
+def test_argmax_infer_struct_info_axis_out_of_range():
+    bb = relax.BlockBuilder()
+    x0 = relax.Var("x", R.Tensor((2, 3, 4, 5), "int64"))
+    x1 = relax.Var("x", R.Tensor("int64", ndim=4))
+
+    with pytest.raises(TVMError):
+        bb.normalize(relax.op.argmax(x0, axis=4))
+    with pytest.raises(TVMError):
+        bb.normalize(relax.op.argmax(x0, axis=-5))
+    with pytest.raises(TVMError):
+        bb.normalize(relax.op.argmax(x1, axis=4))
+    with pytest.raises(TVMError):
+        bb.normalize(relax.op.argmax(x1, axis=-5))
+
+
+def test_argmax_infer_struct_info_wrong_input_type():
+    bb = relax.BlockBuilder()
+    x0 = relax.Var("x", relax.ShapeStructInfo((2, 3, 4, 5)))
+    x1 = relax.Var("x", relax.FuncStructInfo([], R.Tensor((2, 3, 4, 5), "int64")))
+
+    with pytest.raises(TVMError):
+        bb.normalize(relax.op.argmax(x0))
+    with pytest.raises(TVMError):
+        bb.normalize(relax.op.argmax(x1))
 
 
 if __name__ == "__main__":
