@@ -18,8 +18,9 @@
 # pylint: disable=invalid-name, inconsistent-return-statements, unidiomatic-typecheck
 # pylint: disable=import-outside-toplevel
 """PyTorch FX frontend of Relax."""
-from typing import Callable, Dict, List, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from functools import reduce
+import pickle
 
 import tvm
 from tvm import relax
@@ -134,6 +135,9 @@ class TorchFXImporter:
     def _sin(self, node: fx.node.Node) -> relax.Var:
         return self.block_builder.emit(relax.op.sin(self.env[node.args[0]]))
 
+    def _sigmoid(self, node: fx.node.Node) -> relax.Var:
+        return self.block_builder.emit(relax.op.sigmoid(self.env[node.args[0]]))
+
     def _sqrt(self, node: fx.node.Node) -> relax.Expr:
         arg = self.env[node.args[0]]
         if isinstance(arg, (int, float)):
@@ -194,11 +198,83 @@ class TorchFXImporter:
 
     ########## Creation ##########
 
+    def _arange(self, node: fx.node.Node) -> relax.Var:
+        import torch
+        import numpy as np
+
+        start_end_step = [None, None, None]
+        if "start" in node.kwargs:
+            start_end_step[0] = node.kwargs["start"]
+        if "end" in node.kwargs:
+            start_end_step[1] = node.kwargs["end"]
+        if "step" in node.kwargs:
+            start_end_step[2] = node.kwargs["step"]
+
+        if len(node.args) == 1:
+            assert start_end_step[1] is None
+            start_end_step[1] = node.args[0]
+        elif len(node.args) == 2:
+            assert start_end_step[0] is None
+            assert start_end_step[1] is None
+            start_end_step[0] = node.args[0]
+            start_end_step[1] = node.args[1]
+        elif len(node.args) == 3:
+            assert start_end_step[0] is None
+            assert start_end_step[1] is None
+            assert start_end_step[2] is None
+            start_end_step[0] = node.args[0]
+            start_end_step[1] = node.args[1]
+            start_end_step[2] = node.args[2]
+
+        if start_end_step[0] is None:
+            start_end_step[0] = 0
+        if start_end_step[2] is None:
+            start_end_step[2] = 1
+
+        if "dtype" in node.kwargs:
+            dtype = TorchFXImporter._convert_data_type(str(node.kwargs["dtype"]))
+        elif any([isinstance(x, float) for x in start_end_step]):
+            dtype = TorchFXImporter._convert_data_type(torch.get_default_dtype())
+        else:
+            dtype = "int64"
+
+        return relax.const(np.arange(*start_end_step, dtype=dtype))
+
+    def _empty(self, node: fx.node.Node) -> relax.Var:
+        dtype = TorchFXImporter._convert_data_type(str(node.kwargs["dtype"]))
+        return self.block_builder.emit(relax.op.zeros(node.args, dtype))
+
+    def _implace_fill(self, node: fx.node.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        value = self.env[node.args[1]]
+        filled = self.block_builder.emit(
+            relax.op.full(x.struct_info.shape, value, x.struct_info.dtype)
+        )
+        self.env[node.args[0]] = filled
+        return filled
+
+    def _tensor(self, node: fx.node.Node) -> relax.Var:
+        if isinstance(node.args[0], float):
+            return relax.const(node.args[0], "float64")
+        elif isinstance(node.args[0], int):
+            return relax.const(node.args[0], "int64")
+        else:
+            assert False
+
     def _tril(self, node: fx.node.Node) -> relax.Var:
         x = self.env[node.args[0]]
         k = node.args[1] if len(node.args) > 1 else 0
         assert isinstance(k, int)
         return self.block_builder.emit(relax.op.create.tril(x, k))
+
+    def _implace_triu(self, node: fx.node.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        k = node.args[1] if len(node.args) > 1 else 0
+        assert isinstance(k, int)
+
+        triu = self.block_builder.emit(relax.op.create.triu(x, k))
+        self.env[node.args[0]] = triu
+        return triu
 
     def _new_ones(self, node: fx.node.Node) -> relax.Var:
         args = self.retrieve_args(node)
@@ -312,6 +388,27 @@ class TorchFXImporter:
         full_idx = list(range(len(self.shape_of(args[0]))))
         full_idx[args[1]], full_idx[args[2]] = full_idx[args[2]], full_idx[args[1]]
         return self.block_builder.emit(relax.op.permute_dims(args[0], full_idx))
+
+    ########## Search ##########
+
+    def _argmax(self, node: fx.node.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        dim = None
+        keepdims = False
+
+        if len(node.args) > 1:
+            dim = node.args[1]
+        if len(node.args) > 2:
+            keepdims = node.args[2]
+
+        if "dim" in node.kwargs:
+            dim = node.kwargs["dim"]
+        if "keepdim" in node.kwargs:
+            keepdims = node.kwargs["keepdim"]
+        if "keepdims" in node.kwargs:
+            keepdims = node.kwargs["keepdims"]
+
+        return self.block_builder.emit(relax.op.argmax(x, dim, keepdims))
 
     ########## Neural Network ##########
 
@@ -489,7 +586,16 @@ class TorchFXImporter:
         module = self.named_modules[node.target]
         weight = self.params[module.weight]
         x = self.block_builder.emit(relax.op.astype(x, "int32"))
-        return self.block_builder.emit(relax.op.take(weight, x, axis=0))
+
+        ndim = x.struct_info.ndim
+        if ndim == 1:
+            return self.block_builder.emit(relax.op.take(weight, x, axis=0))
+        else:
+            x_shape = x.struct_info.shape.values
+            emb_size = weight.struct_info.shape.values[-1]
+            x = self.block_builder.emit(relax.op.reshape(x, shape=[-1]))
+            embedding = self.block_builder.emit(relax.op.take(weight, x, axis=0))
+            return self.block_builder.emit(relax.op.reshape(embedding, [*x_shape, emb_size]))
 
     def _interpolate(self, node: fx.node.Node) -> relax.Var:
         # torch.nn.functional.interpolate(
@@ -552,12 +658,36 @@ class TorchFXImporter:
         return getattr(self.env[node.args[0]], node.args[1])
 
     def _getitem(self, node: fx.node.Node) -> relax.Var:
+        from torch import fx
+
         x = self.env[node.args[0]]
         if isinstance(x, (list, tuple, relax.ShapeExpr, relax.Tuple)):
             return x[node.args[1]]
         elif isinstance(x, relax.Var):
             if isinstance(x.struct_info, relax.TupleStructInfo):
                 return self.block_builder.emit(relax.TupleGetItem(x, node.args[1]))
+
+            indices = node.args[1]
+            new_indices = []
+            has_index_expr = False
+            dim_to_squeeze = []
+            for i, index in enumerate(indices):
+                if isinstance(index, fx.node.Node):
+                    index = self.env[index]
+                    assert isinstance(index, relax.Expr)
+                    assert index.struct_info.ndim == 1
+                    assert index.struct_info.shape[0].value == 1
+                    x = self.block_builder.emit(relax.op.take(x, index, axis=i))
+
+                    if not has_index_expr:
+                        has_index_expr = True
+                        new_indices.append(None)
+                    else:
+                        dim_to_squeeze.append(i)
+                else:
+                    new_indices.append(index)
+            if has_index_expr and len(dim_to_squeeze) > 0:
+                x = self.block_builder.emit(relax.op.squeeze(x, dim_to_squeeze))
 
             assert isinstance(x.struct_info, relax.TensorStructInfo)
             begin = []
@@ -567,7 +697,7 @@ class TorchFXImporter:
             expand_dim = []
             i = 0
             shape = self.shape_of(x)
-            for index in node.args[1]:
+            for index in new_indices:
                 if isinstance(index, int):
                     begin.append(index)
                     end.append(index + 1)
@@ -588,6 +718,7 @@ class TorchFXImporter:
             while i < len(shape):
                 begin.append(0)
                 end.append(shape[i])
+                stride.append(1)
                 axes.append(i)
                 i = i + 1
             sliced = self.block_builder.emit(relax.op.strided_slice(x, axes, begin, end, stride))
@@ -595,6 +726,9 @@ class TorchFXImporter:
             for i in expand_dim:
                 sliced_shape.insert(i, 1)
             return self.block_builder.emit(relax.op.reshape(sliced, sliced_shape))
+        elif isinstance(x, relax.Constant):
+            dtype = x.struct_info.dtype
+            return relax.const(x.data.numpy()[node.args[1]], dtype)
         else:
             assert False
 
@@ -627,17 +761,24 @@ class TorchFXImporter:
             "floordiv": self._floordiv,
             "mul": self._mul,
             "sub": self._sub,
+            "sigmoid": self._sigmoid,
             "sqrt": self._sqrt,
             "lt": self._lt,
             "truediv": self._truediv,
+            "fill_": self._implace_fill,
             "new_ones": self._new_ones,
+            "arange": self._arange,
+            "empty": self._empty,
+            "tensor": self._tensor,
             "tril": self._tril,
+            "triu_": self._implace_triu,
             "sum": self._sum,
             "float": self._float,
             "half": self._half,
             "type": self._type,
             "matmul": self._matmul,
             "addmm": self._addmm,
+            "bmm": self._matmul,
             "cat": self._cat,
             "expand": self._expand,
             "flatten": self._flatten,
@@ -649,7 +790,9 @@ class TorchFXImporter:
                 relax.op.expand_dims(self.env[node.args[0]], node.args[1])
             ),
             "view": self._reshape,
+            "argmax": self._argmax,
             "softmax": self._softmax,
+            "dropout": lambda node: self.env[node.args[0]],
             "clamp": self._clamp,
             "relu": lambda node: self.block_builder.emit(relax.op.nn.relu(self.env[node.args[0]])),
             "gelu": lambda node: self.block_builder.emit(relax.op.nn.gelu(self.env[node.args[0]])),
@@ -658,11 +801,17 @@ class TorchFXImporter:
             "getattr": self._getattr,
             "getitem": self._getitem,
             "contiguous": lambda node: self.env[node.args[0]],
+            "to": lambda node: self.env[node.args[0]],
             "adaptive_avg_pool2d": self._adaptive_avg_pool2d(is_module=False),
         }
 
     def from_fx(
-        self, model, input_info: List[Tuple[Tuple[int], str]], keep_params_as_input: bool
+        self,
+        model,
+        input_info: List[Tuple[Tuple[int], str]],
+        keep_params_as_input: bool,
+        param_dump_name_prefix: Optional[str] = None,
+        param_dump_dir: Optional[str] = None,
     ) -> tvm.IRModule:
         """Convert a PyTorch FX GraphModule to a Relax program."""
         from torch import fx
@@ -683,11 +832,30 @@ class TorchFXImporter:
         self.block_builder = relax.BlockBuilder()
         if keep_params_as_input:
             func_attrs = {"num_input": len(inputs)}
-            for name, param in model.named_parameters():
+            existing_names = set()
+            for i, (name, param) in enumerate(model.named_parameters()):
                 shape = param.data.shape
                 dtype = self._convert_data_type(str(param.data.dtype))
                 inputs.append(relax.Var(name, relax.TensorStructInfo(shape, dtype)))
                 self.params[param] = inputs[-1]
+
+                assert name not in existing_names
+                existing_names.add(name)
+                if param_dump_name_prefix is not None:
+                    assert param_dump_dir is not None
+                    param_np = param.data.cpu().numpy()
+                    file = open(
+                        param_dump_dir + "/" + param_dump_name_prefix + "_" + str(i) + ".pkl", "wb"
+                    )
+                    pickle.dump(param_np, file)
+                    file.close()
+                    file = open(
+                        param_dump_dir + "/" + param_dump_name_prefix + "_" + str(i) + ".pkl", "rb"
+                    )
+                    loaded_np = pickle.load(file)
+                    file.close()
+                    import numpy as np
+                    np.testing.assert_allclose(loaded_np, param_np)
         else:
             func_attrs = None
 
@@ -740,7 +908,11 @@ class TorchFXImporter:
 
 
 def from_fx(
-    model, input_info: List[Tuple[Tuple[int], str]], keep_params_as_input: bool = False
+    model,
+    input_info: List[Tuple[Tuple[int], str]],
+    keep_params_as_input: bool = False,
+    param_dump_name_prefix: Optional[str] = None,
+    param_dump_dir: Optional[str] = None,
 ) -> tvm.IRModule:
     """Convert a PyTorch FX GraphModule to a Relax program
 
@@ -818,4 +990,6 @@ def from_fx(
     to print out the tabular representation of the PyTorch module, and then
     check the placeholder rows in the beginning of the tabular.
     """
-    return TorchFXImporter().from_fx(model, input_info, keep_params_as_input)
+    return TorchFXImporter().from_fx(
+        model, input_info, keep_params_as_input, param_dump_name_prefix, param_dump_dir
+    )
