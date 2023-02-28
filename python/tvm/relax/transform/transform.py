@@ -330,7 +330,7 @@ def MergeCompositeFunctions() -> tvm.ir.transform.Pass:
     return _ffi_api.MergeCompositeFunctions()  # type: ignore
 
 
-def LiftTransformParams() -> tvm.ir.transform.Pass:
+def LiftTransformParams(entry_names) -> tvm.ir.transform.Pass:
     """Lift transformation of the parameters of a function.
 
     When some inputs of the function is marked as 'parameters' (the model weights), this pass
@@ -347,7 +347,7 @@ def LiftTransformParams() -> tvm.ir.transform.Pass:
     ret : tvm.transform.Pass
         The registered pass for lifting transformation of parameters.
     """
-    return _ffi_api.LiftTransformParams()  # type: ignore
+    return _ffi_api.LiftTransformParams(entry_names)  # type: ignore
 
 
 def LegalizeOps(customize_legalize_map: Optional[Dict[str, LegalizeFunc]] = None):
