@@ -71,6 +71,8 @@ class TorchFXImporter:
             return "float16"
         elif input_type in ["int64", "torch.int64", torch.int64]:
             return "int64"
+        elif input_type in ["int32", "torch.int32", torch.int32]:
+            return "int32"
         else:
             raise NotImplementedError("input_type {} is not handled yet".format(input_type))
 
@@ -143,6 +145,12 @@ class TorchFXImporter:
         if isinstance(arg, (int, float)):
             arg = relax.const(arg, "float32")
         return self.block_builder.emit(relax.op.sqrt(arg))
+
+    def _round(self, node: fx.node.Node) -> relax.Expr:
+        if "decimals" in node.kwargs and node.kwargs["decimals"] != 0:
+            raise ValueError("specifying decimals for round is not supported yet")
+        arg = self.env[node.args[0]]
+        return self.block_builder.emit(relax.op.round(arg))
 
     def _add(self, node: fx.node.Node) -> relax.Expr:
         lhs, rhs = self.retrieve_args(node)
@@ -383,11 +391,34 @@ class TorchFXImporter:
         n_section = (self.shape_of(x)[dim].value + split_size - 1) // split_size
         return self.block_builder.emit(relax.op.split(x, n_section, dim))
 
+    def _chunk(self, node: fx.node.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        chunks = node.args[1]
+
+        if "dim" in node.kwargs:
+            dim = node.kwargs["dim"]
+        elif len(node.args) > 2:
+            dim = node.args[2]
+        else:
+            dim = 0
+        return self.block_builder.emit(relax.op.split(x, chunks, dim))
+
     def _transpose(self, node: fx.node.Node) -> relax.Var:
         args = self.retrieve_args(node)
         full_idx = list(range(len(self.shape_of(args[0]))))
         full_idx[args[1]], full_idx[args[2]] = full_idx[args[2]], full_idx[args[1]]
         return self.block_builder.emit(relax.op.permute_dims(args[0], full_idx))
+
+    def _squeeze(self, node: fx.node.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+
+        if "dim" in node.kwargs:
+            dim = node.kwargs["dim"]
+        elif len(node.args) > 1:
+            dim = node.args[1]
+        else:
+            dim = None
+        return self.block_builder.emit(relax.op.squeeze(x, dim))
 
     ########## Search ##########
 
@@ -763,6 +794,7 @@ class TorchFXImporter:
             "sub": self._sub,
             "sigmoid": self._sigmoid,
             "sqrt": self._sqrt,
+            "round": self._round,
             "lt": self._lt,
             "truediv": self._truediv,
             "fill_": self._implace_fill,
@@ -775,6 +807,7 @@ class TorchFXImporter:
             "sum": self._sum,
             "float": self._float,
             "half": self._half,
+            "astype": self._type,
             "type": self._type,
             "matmul": self._matmul,
             "addmm": self._addmm,
@@ -785,7 +818,9 @@ class TorchFXImporter:
             "permute": self._permute,
             "reshape": self._reshape,
             "split": self._split,
+            "chunk": self._chunk,
             "transpose": self._transpose,
+            "squeeze": self._squeeze,
             "unsqueeze": lambda node: self.block_builder.emit(
                 relax.op.expand_dims(self.env[node.args[0]], node.args[1])
             ),
@@ -810,9 +845,7 @@ class TorchFXImporter:
         model,
         input_info: List[Tuple[Tuple[int], str]],
         keep_params_as_input: bool,
-        param_dump_name_prefix: Optional[str] = None,
-        param_dump_dir: Optional[str] = None,
-    ) -> tvm.IRModule:
+    ) -> Tuple[tvm.IRModule, Optional[List[tvm.nd.NDArray]]]:
         """Convert a PyTorch FX GraphModule to a Relax program."""
         from torch import fx
 
@@ -832,32 +865,16 @@ class TorchFXImporter:
         self.block_builder = relax.BlockBuilder()
         if keep_params_as_input:
             func_attrs = {"num_input": len(inputs)}
-            existing_names = set()
-            for i, (name, param) in enumerate(model.named_parameters()):
+            param_ndarrays = []
+            for name, param in model.named_parameters():
                 shape = param.data.shape
                 dtype = self._convert_data_type(str(param.data.dtype))
                 inputs.append(relax.Var(name, relax.TensorStructInfo(shape, dtype)))
                 self.params[param] = inputs[-1]
-
-                assert name not in existing_names
-                existing_names.add(name)
-                if param_dump_name_prefix is not None:
-                    assert param_dump_dir is not None
-                    param_np = param.data.cpu().numpy()
-                    file = open(
-                        param_dump_dir + "/" + param_dump_name_prefix + "_" + str(i) + ".pkl", "wb"
-                    )
-                    pickle.dump(param_np, file)
-                    file.close()
-                    file = open(
-                        param_dump_dir + "/" + param_dump_name_prefix + "_" + str(i) + ".pkl", "rb"
-                    )
-                    loaded_np = pickle.load(file)
-                    file.close()
-                    import numpy as np
-                    np.testing.assert_allclose(loaded_np, param_np)
+                param_ndarrays.append(tvm.nd.array(param.data.cpu().numpy()))
         else:
             func_attrs = None
+            param_ndarrays = None
 
         with self.block_builder.function(name="main", params=inputs.copy(), attrs=func_attrs):
             output = None
@@ -904,16 +921,14 @@ class TorchFXImporter:
             assert output is not None
             self.block_builder.emit_func_output(output)
 
-        return self.block_builder.get()
+        return self.block_builder.get(), param_ndarrays
 
 
 def from_fx(
     model,
     input_info: List[Tuple[Tuple[int], str]],
     keep_params_as_input: bool = False,
-    param_dump_name_prefix: Optional[str] = None,
-    param_dump_dir: Optional[str] = None,
-) -> tvm.IRModule:
+) -> Tuple[tvm.IRModule, Optional[List[tvm.nd.NDArray]]]:
     """Convert a PyTorch FX GraphModule to a Relax program
 
     Parameters
@@ -990,6 +1005,4 @@ def from_fx(
     to print out the tabular representation of the PyTorch module, and then
     check the placeholder rows in the beginning of the tabular.
     """
-    return TorchFXImporter().from_fx(
-        model, input_info, keep_params_as_input, param_dump_name_prefix, param_dump_dir
-    )
+    return TorchFXImporter().from_fx(model, input_info, keep_params_as_input)

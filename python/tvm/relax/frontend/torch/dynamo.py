@@ -20,7 +20,7 @@
 # mypy: ignore-errors
 """PyTorch Dynamo backend of Relax."""
 import functools
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import tvm
 from tvm.relax import build as relax_build
@@ -114,7 +114,9 @@ def relax_dynamo(pipeline: Optional[tvm.transform.Pass] = None):
     return _relax_backend
 
 
-def dynamo_capture_subgraphs(model, *params) -> tvm.ir.IRModule:
+def dynamo_capture_subgraphs(
+    model, *params, **kwargs
+) -> Tuple[tvm.ir.IRModule, Optional[Dict[str, List[tvm.nd.NDArray]]]]:
     """Capture subgraphs of the PyTorch model using torch.compile into an IRModule.
 
     Parameters
@@ -135,18 +137,23 @@ def dynamo_capture_subgraphs(model, *params) -> tvm.ir.IRModule:
     from torch import _dynamo as dynamo  # type: ignore[import]
 
     mod = tvm.IRModule()
+    mod_param_ndarrays = dict()
+
+    keep_params_as_input = "keep_params_as_input" in kwargs and kwargs["keep_params_as_input"]
 
     def _capture(graph_module: fx.GraphModule, example_inputs):
         assert isinstance(graph_module, torch.fx.GraphModule)
         input_info = [(tuple(tensor.shape), str(tensor.dtype)) for tensor in example_inputs]
-        subgraph = from_fx(graph_module, input_info)
-        mod["subgraph_" + str(len(mod.get_global_vars()))] = subgraph["main"]
+        subgraph, param_ndarrays = from_fx(graph_module, input_info, keep_params_as_input)
+        func_name = f"subgraph_{len(mod.get_global_vars())}"
+        mod[func_name] = subgraph["main"]
+        mod_param_ndarrays[func_name] = param_ndarrays
         return graph_module.forward
 
     dynamo.reset()
     compiled_model = torch.compile(model, backend=_capture)
     compiled_model(*params)
-    return mod
+    return mod, (mod_param_ndarrays if keep_params_as_input else None)
 
 
 @functools.lru_cache(None)
