@@ -133,7 +133,7 @@ def test_reshape_infer_struct_info_shape_symbolic():
     _check_inference(
         bb,
         relax.op.reshape(x, (d, c, b, -1)),
-        relax.TensorStructInfo((d, c, b, tir.floordiv(a * b * c * d, d * c * b)), "float32"),
+        relax.TensorStructInfo((d, c, b, a), "float32"),
     )
     _check_inference(
         bb,
